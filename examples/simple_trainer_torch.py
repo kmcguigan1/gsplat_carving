@@ -449,7 +449,7 @@ class Runner:
         masks: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
+        means = self.splats["means"]  # [N, 3], N is the number of Gaussians
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.tanh(self.splats["opacities"])  # [N,] # TODO: possible change to tanh
