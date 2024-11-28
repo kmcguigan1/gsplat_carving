@@ -397,6 +397,7 @@ def isect_tiles(
         assert radii.shape == (C, N), radii.size()
         assert depths.shape == (C, N), depths.size()
 
+    # Flatten ids are sorted based on depth
     tiles_per_gauss, isect_ids, flatten_ids = _make_lazy_cuda_func("isect_tiles")(
         means2d.contiguous(),
         radii.contiguous(),

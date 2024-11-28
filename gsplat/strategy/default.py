@@ -164,41 +164,42 @@ class DefaultStrategy(Strategy):
 
         self._update_state(params, state, info, packed=packed)
 
-        if (
-            step > self.refine_start_iter
-            and step % self.refine_every == 0
-            and step % self.reset_every >= self.pause_refine_after_reset
-        ):
-            # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
-            if self.verbose:
-                print(
-                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
-                    f"Now having {len(params['means'])} GSs."
-                )
+        #TODO: For now I disable the growing and pruning strategy since we need to figure out what to do with the negative opaicities. 
+        # if (
+        #     step > self.refine_start_iter
+        #     and step % self.refine_every == 0
+        #     and step % self.reset_every >= self.pause_refine_after_reset
+        # ):
+        #     # grow GSs
+        #     n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+        #     if self.verbose:
+        #         print(
+        #             f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
+        #             f"Now having {len(params['means'])} GSs."
+        #         )
 
-            # prune GSs
-            n_prune = self._prune_gs(params, optimizers, state, step)
-            if self.verbose:
-                print(
-                    f"Step {step}: {n_prune} GSs pruned. "
-                    f"Now having {len(params['means'])} GSs."
-                )
+        #     # prune GSs
+        #     n_prune = self._prune_gs(params, optimizers, state, step)
+        #     if self.verbose:
+        #         print(
+        #             f"Step {step}: {n_prune} GSs pruned. "
+        #             f"Now having {len(params['means'])} GSs."
+        #         )
 
-            # reset running stats
-            state["grad2d"].zero_()
-            state["count"].zero_()
-            if self.refine_scale2d_stop_iter > 0:
-                state["radii"].zero_()
-            torch.cuda.empty_cache()
+        #     # reset running stats
+        #     state["grad2d"].zero_()
+        #     state["count"].zero_()
+        #     if self.refine_scale2d_stop_iter > 0:
+        #         state["radii"].zero_()
+        #     torch.cuda.empty_cache()
 
-        if step % self.reset_every == 0:
-            reset_opa(
-                params=params,
-                optimizers=optimizers,
-                state=state,
-                value=self.prune_opa * 2.0,
-            )
+        # if step % self.reset_every == 0:
+        #     reset_opa(
+        #         params=params,
+        #         optimizers=optimizers,
+        #         state=state,
+        #         value=self.prune_opa * 2.0,
+        #     )
 
     def _update_state(
         self,

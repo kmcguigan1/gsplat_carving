@@ -38,7 +38,7 @@ from lib_bilagrid import (
 
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
-from gsplat.rendering import _torch_rasterization as rasterization 
+from gsplat.rendering import _torch_rasterization as rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 
@@ -222,7 +222,7 @@ def create_splats_with_optimizers(
 
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    opacities = torch.arctanh(torch.full((N,), init_opacity))  # [N,]
 
     params = [
         # name, value, lr
@@ -450,11 +450,9 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        opacities = torch.tanh(self.splats["opacities"])  # [N,] # TODO: possible change to tanh
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -507,6 +505,7 @@ class Runner:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
 
+        # Number of Max Steps
         max_steps = cfg.max_steps
         init_step = 0
 
@@ -567,7 +566,7 @@ class Runner:
                 data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
-            Ks = data["K"].to(device)  # [1, 3, 3]
+            Ks = data["K"].to(device)  # [1, 3, 3] Intrinsic Matrix
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
@@ -620,6 +619,9 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            # Ensures that gradiants of intermidate steps is retained. 
+            # Could be slowing down thing we might need to remove it
+            # TODO:
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -662,7 +664,7 @@ class Runner:
                 loss = (
                     loss
                     + cfg.opacity_reg
-                    * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
+                    * torch.abs(torch.tanh(self.splats["opacities"])).mean()
                 )
             if cfg.scale_reg > 0.0:
                 loss = (

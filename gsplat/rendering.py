@@ -654,10 +654,13 @@ def _torch_rasterization(
         ), colors.shape
         assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
 
+
+    # Get the covariance matrix
+    covars, _ = _quat_scale_to_covar_preci(quats, scales, True, False, triu=False)
+    
     # Project Gaussians to 2D.
     # The results are with shape [C, N, ...]. Only the elements with radii > 0 are valid.
-    covars, _ = _quat_scale_to_covar_preci(quats, scales, True, False, triu=False)
-    radii, means2d, depths, conics, compensations = _fully_fused_projection(
+    radii, means2d, depths, depths_persp, conics, compensations = _fully_fused_projection(
         means,
         covars,
         viewmats,
@@ -759,6 +762,7 @@ def _torch_rasterization(
         render_colors = torch.cat(render_colors, dim=-1)
         render_alphas = render_alphas[0]  # discard the rest
     else:
+
         render_colors, render_alphas = _rasterize_to_pixels(
             means2d,
             conics,
@@ -769,6 +773,7 @@ def _torch_rasterization(
             tile_size,
             isect_offsets,
             flatten_ids,
+            depths_persp,
             backgrounds=backgrounds,
             batch_per_iter=batch_per_iter,
         )
