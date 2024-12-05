@@ -488,9 +488,9 @@ def accumulate(
     channels = colors.shape[-1]
 
     pixel_ids_x = pixel_ids % image_width
-    pixel_ids_y = pixel_ids // image_width
-    pixel_coords = torch.stack([pixel_ids_x, pixel_ids_y], dim=-1) + 0.5  # [M, 2]
-    deltas = pixel_coords - means2d[camera_ids, gaussian_ids]  # [M, 2]
+    pixel_ids_y = pixel_ids // image_width # 8510MiB
+    pixel_coords = torch.stack([pixel_ids_x, pixel_ids_y], dim=-1) + 0.5  # [M, 2] 13100MiB
+    deltas = pixel_coords - means2d[camera_ids, gaussian_ids]  # [M, 2] 13100MiB
     c = conics[camera_ids, gaussian_ids]  # [M, 3]  15394MiB
     sigmas = (
         0.5 * (c[:, 0] * deltas[:, 0] ** 2 + c[:, 2] * deltas[:, 1] ** 2)
