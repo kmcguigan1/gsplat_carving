@@ -564,7 +564,7 @@ def accumulate(
 
     pixel_ids_x = pixel_ids % image_width
     pixel_ids_y = pixel_ids // image_width
-    pixel_coords = torch.stack([pixel_ids_x, pixel_ids_y], dim=-1) + 0.5  # [M, 2]
+    pixel_coords = torch.stack([pixel_ids_x, pixel_ids_y], dim=-1) + 0.5  # [M, 2] 13132MiB
 
 
     # Positive Gaussians -------------------------
@@ -580,11 +580,11 @@ def accumulate(
     sigmas = (
         0.5 * (c[..., 0, 0] * deltas[:, 0] ** 2 + c[..., 1, 1] * deltas[:, 1] ** 2)
         + c[:, 0, 1] * deltas[:, 0] * deltas[:, 1]
-    )  # [P]
+    )  # [P] 29962MiB
 
     alphas = torch.clamp_max(
         opacities[camera_ids[pos_ids], gaussian_ids[pos_ids]] * torch.exp(-sigmas), 0.999
-    )
+    )  # 34552MiB
 
 
     # Negative Gaussians ------------------------
@@ -614,7 +614,7 @@ def accumulate(
         alphas = alphas.clip(min=0)
 
 
-    indices = camera_ids * image_height * image_width + pixel_ids
+    indices = camera_ids * image_height * image_width + pixel_ids # 38378MiB 
     total_pixels = C * image_height * image_width
 
     weights, trans = render_weight_from_alpha(
@@ -625,10 +625,10 @@ def accumulate(
         colors[camera_ids, gaussian_ids],
         ray_indices=indices,
         n_rays=total_pixels,
-    ).reshape(C, image_height, image_width, channels)
+    ).reshape(C, image_height, image_width, channels) # 42966MiB
     alphas = accumulate_along_rays(
         weights, None, ray_indices=indices, n_rays=total_pixels
-    ).reshape(C, image_height, image_width, 1)
+    ).reshape(C, image_height, image_width, 1) # 42966MiB
 
     return renders, alphas
 
@@ -729,7 +729,7 @@ def _rasterize_to_pixels(
             image_width,
             image_height,
             depths_persp
-        )
+        ) # 7012MiB
         render_colors = render_colors + renders_step * transmittances[..., None]
         render_alphas = render_alphas + accs_step * transmittances[..., None]
 
