@@ -699,6 +699,7 @@ def _rasterize_to_pixels(
         conics_2d = torch.stack(
             [conic_0, conic_1, conic_2],
             dim=-1) 
+        # Increased the GPU men ------
         gs_ids, pixel_ids, camera_ids = rasterize_to_indices_in_range(
             step,
             step + batch_per_iter,
@@ -718,6 +719,7 @@ def _rasterize_to_pixels(
 
         # TODO Need to pass depth
         # Accumulate the renderings within this batch of Gaussians.
+        # Almost fulled gpu usage  -------- 
         renders_step, accs_step = accumulate(
             means2d,
             conics,
