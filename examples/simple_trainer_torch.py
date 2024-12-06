@@ -673,6 +673,7 @@ class Runner:
                 )
 
             loss.backward()
+            torch.cuda.empty_cache()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:

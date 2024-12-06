@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange
+import gc
+
 
 def _quat_to_rotmat(quats: Tensor) -> Tensor:
     """Convert quaternion to rotation matrix."""
@@ -563,7 +565,7 @@ def accumulate(
     channels = colors.shape[-1]
 
     pixel_ids_x = pixel_ids % image_width
-    pixel_ids_y = pixel_ids // image_width
+    pixel_ids_y = pixel_ids // image_width  # 8542MiB
     pixel_coords = torch.stack([pixel_ids_x, pixel_ids_y], dim=-1) + 0.5  # [M, 2] 13132MiB
 
 
@@ -571,21 +573,37 @@ def accumulate(
 
     # While the oppasities may be different from each camera due to antialiasing
     # The oppacity will never flip sign due to it.
-    pos_ids = opacities[0,gaussian_ids].flatten()>0 # [P]
+    # Determine which Gaussians are positive
 
-    deltas = pixel_coords[gaussian_ids[pos_ids],:] - means2d[camera_ids[pos_ids], gaussian_ids[pos_ids]]  # [P, 2]
+    # Try to do minimal advanced indexing: first only create pos_ids as boolean mask
+    pos_ids = (opacities[0, gaussian_ids].flatten() > 0)
 
-    c = conics[camera_ids[pos_ids], gaussian_ids[pos_ids],:,:]  # [P, 3, 3]
+    # Convert boolean mask to integer indices
+    pos_indices = torch.nonzero(pos_ids, as_tuple=False).squeeze(-1)
+    # pos_indices now contains the indices of gaussian_ids/camera_ids that are positive
+
+    # Use integer indices to filter arrays - this typically uses less memory
+    filtered_gaussian_ids = gaussian_ids[pos_indices]
+    filtered_camera_ids   = camera_ids[pos_indices]   # 16192MiB 
+
+
+    deltas = pixel_coords[filtered_gaussian_ids,:] - means2d[filtered_camera_ids,filtered_gaussian_ids]  # [P, 2] 19252MiB
+
+    c = conics[filtered_camera_ids, filtered_gaussian_ids,:,:]  # [P, 3, 3]
 
     sigmas = (
         0.5 * (c[..., 0, 0] * deltas[:, 0] ** 2 + c[..., 1, 1] * deltas[:, 1] ** 2)
         + c[:, 0, 1] * deltas[:, 0] * deltas[:, 1]
-    )  # [P] 29962MiB
+    )  # [P] 28430MiB
 
     alphas = torch.clamp_max(
-        opacities[camera_ids[pos_ids], gaussian_ids[pos_ids]] * torch.exp(-sigmas), 0.999
-    )  # 34552MiB
+        opacities[filtered_camera_ids, filtered_gaussian_ids] * torch.exp(-sigmas), 0.999
+    )  # 29962MiB
 
+    del pos_ids, pos_indices, pixel_ids_x, pixel_ids_y, sigmas, deltas, c, filtered_gaussian_ids, filtered_camera_ids
+    gc.collect()
+    torch.cuda.empty_cache()
+    
 
     # Negative Gaussians ------------------------
 
