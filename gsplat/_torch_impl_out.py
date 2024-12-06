@@ -340,7 +340,140 @@ def _fully_fused_projection(
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
     """PyTorch implementation of `gsplat.cuda._wrapper.fully_fused_projection()`
+    
+    Project 3D Gaussian parameters from world space into the 2D image space of one or more cameras,
+    optionally computing compensation factors and conic matrices for each projected Gaussian.
 
+    This function takes a set of 3D Gaussian distributions (each defined by a mean and covariance),
+    transforms them from a common world coordinate system into one or more camera coordinate systems,
+    projects them onto each camera’s 2D image plane, and computes per-Gaussian elliptical footprints
+    (radii) and additional derived quantities.
+
+    The projection process can be performed using one of three camera models:
+    - **pinhole**: A standard perspective projection model.
+    - **ortho**: An orthographic projection.
+    - **fisheye**: A fisheye (wide-angle) projection model.
+
+    Depending on the chosen camera model, the function computes the 2D projected means and covariances,
+    as well as various depth measures, adjusted covariances, and optional compensation factors.
+
+    Parameters
+    ----------
+    means : Tensor
+        A tensor of shape `[N, 3]` representing the 3D mean positions of N Gaussian components 
+        in the world coordinate system.
+    
+    covars : Tensor
+        A tensor of shape `[N, 3, 3]` representing the 3D covariance matrices of the N Gaussian 
+        components in world coordinates. Each covariance must be a positive semi-definite matrix.
+    
+    viewmats : Tensor
+        A tensor of shape `[C, 4, 4]` representing the camera extrinsic matrices for C different 
+        cameras. Each matrix transforms points from world coordinates into the camera’s view space.
+    
+    Ks : Tensor
+        A tensor of shape `[C, 3, 3]` representing the intrinsic camera matrices for C cameras.
+        For the pinhole camera model, this typically includes focal lengths and principal point 
+        offsets. For orthographic or fisheye models, it may be adapted accordingly.
+    
+    width : int
+        The width (in pixels) of the image or viewport associated with each camera.
+    
+    height : int
+        The height (in pixels) of the image or viewport associated with each camera.
+    
+    eps2d : float, optional
+        A small regularization term added to the top-left 2x2 block of the projected covariance 
+        matrices. This helps maintain numerical stability and prevents singularities in the 
+        2D covariance matrices. Default is 0.3.
+    
+    near_plane : float, optional
+        The near clipping plane distance. Gaussians whose transformed depth is less than this 
+        value will be considered invalid and will have zero radius. Default is 0.01.
+    
+    far_plane : float, optional
+        The far clipping plane distance. Gaussians whose transformed depth is greater than this 
+        value will be considered invalid and will have zero radius. Default is 1e10.
+    
+    calc_compensations : bool, optional
+        If `True`, compute and return compensation factors that relate the original determinant 
+        of the 3D covariance to the adjusted determinant after 2D regularization (`eps2d`) is applied. 
+        These compensation values can be useful for adjusting the weight of each Gaussian after 
+        projection. Default is `False`.
+    
+    camera_model : {"pinhole", "ortho", "fisheye"}, optional
+        Specifies the camera projection model to use.
+        - `"pinhole"`: Uses a standard perspective projection.
+        - `"ortho"`: Uses an orthographic projection.
+        - `"fisheye"`: Uses a fisheye projection model.
+        
+        Default is `"pinhole"`.
+
+    Returns
+    -------
+    radii : Tensor
+        A tensor of shape `[C, N]` representing the radius (in pixels) of an elliptical footprint 
+        that bounds each projected Gaussian on the image plane. If a Gaussian is invalid (outside 
+        the near/far clipping planes or outside the image boundaries), its radius will be set to 0.
+    
+    means2d : Tensor
+        A tensor of shape `[C, N, 2]` containing the projected 2D mean positions (in pixel 
+        coordinates) of the Gaussians in each camera’s image space.
+    
+    depths : Tensor
+        A tensor of shape `[C, N]` containing the per-Gaussian depth values in camera coordinates. 
+        For a pinhole camera model, this corresponds to the Z-coordinate in the camera’s view space. 
+        For orthographic and fisheye models, this also corresponds to the camera-space depth.
+    
+    depths_persp : Tensor
+        A tensor of shape `[C, N]` giving perspective-corrected depths for the pinhole camera model. 
+        For orthographic or fisheye models, this value may be `None`. Perspective depth is typically 
+        used for proper weighting in a rendering pipeline.
+    
+    conics : Tensor
+        A tensor of shape `[C, N, 3, 3]` representing the inverse covariance matrices (conics) 
+        of the projected Gaussians on the image plane. This can be used to evaluate Gaussian 
+        densities or for further geometric processing in image space.
+    
+    compensations : Tensor or None
+        If `calc_compensations` is `True`, returns a tensor of shape `[C, N]` representing the 
+        ratio of the original Gaussian covariance determinant to the adjusted determinant after 
+        adding `eps2d`. This factor can be used to compensate for the added regularization. If 
+        `calc_compensations` is `False`, `None` is returned.
+
+    Notes
+    -----
+    - This function leverages transformations to camera coordinates using `viewmats` and 
+      projection using `Ks` based on the chosen `camera_model`.
+    - The `radii` are computed as a scalar bounding radius derived from the projected 2D covariance.
+      They represent a conservative estimate of the Gaussian’s footprint in image space.
+    - Gaussians that project partially or fully outside the image boundaries or lie outside the 
+      near/far clipping planes have their radii (and potentially other attributes) set to zero or 
+      truncated values.
+    - The `eps2d` parameter ensures numerical stability when dealing with very small or degenerate 
+      Gaussians, by broadening their 2D footprint slightly.
+    - For the pinhole model, `depths_persp` provides an additional depth measure useful for 
+      perspective-correct rendering or sorting.
+    - Some internal computations (such as `_world_to_cam`, `_ortho_proj`, `_fisheye_proj`, 
+      `_persp_proj`, `compute_determinant_3d`, and `compute_inverse_3d`) are assumed to be 
+      implemented separately, handling the lower-level math for transformations and projections.
+
+    Example
+    -------
+    Suppose you have:
+    - `N` Gaussian distributions defined in world space.
+    - `C` cameras, each with a known view matrix `viewmats[c]` and intrinsic matrix `Ks[c]`.
+
+    You can project them as follows:
+    ```python
+    radii, means2d, depths, depths_persp, conics, comps = _fully_fused_projection(
+        means, covars, viewmats, Ks, width=1920, height=1080, camera_model="pinhole"
+    )
+    ```
+
+    After this, you can use `means2d` and `radii` to visualize Gaussian footprints on each camera’s 
+    image, or `conics` and `comps` for more advanced image-space operations.
+    
     .. note::
 
         This is a minimal implementation of fully fused version, which has more
@@ -724,7 +857,7 @@ def _rasterize_to_pixels(
             transmittances,
             means2d,
             conics_2d,
-            opacities,
+            torch.abs(opacities),
             image_width,
             image_height,
             tile_size,

@@ -222,7 +222,7 @@ def create_splats_with_optimizers(
 
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.arctanh(torch.full((N,), init_opacity))  # [N,]
+    opacities = torch.arctanh(torch.full((N,), init_opacity))  # [N,] TODO: Changes for negative gaussian splatting
 
     params = [
         # name, value, lr
