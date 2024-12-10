@@ -716,13 +716,12 @@ def accumulate(
     # pos_indices now contains the indices of gaussian_ids/camera_ids that are positive
 
     # Use integer indices to filter arrays - this typically uses less memory
-    filtered_gaussian_ids = gaussian_ids[pos_indices]
-    filtered_camera_ids   = camera_ids[pos_indices]   # 16192MiB 
+    fgi_pos = gaussian_ids[pos_indices] # filtered_gaussian_ids_pos
+    fci_pos  = camera_ids[pos_indices]  # filtered_camera_ids_pos
 
+    deltas = pixel_coords[fgi_pos,:] - means2d[fci_pos,fgi_pos]  # [P, 2] 
 
-    deltas = pixel_coords[filtered_gaussian_ids,:] - means2d[filtered_camera_ids,filtered_gaussian_ids]  # [P, 2] 19252MiB
-
-    c = conics[filtered_camera_ids, filtered_gaussian_ids,:,:]  # [P, 3, 3]
+    c = conics[fci_pos, fgi_pos,:,:]  # [P, 3, 3]
 
     sigmas = (
         0.5 * (c[..., 0, 0] * deltas[:, 0] ** 2 + c[..., 1, 1] * deltas[:, 1] ** 2)
@@ -730,20 +729,30 @@ def accumulate(
     )  # [P] 28430MiB
 
     alphas = torch.clamp_max(
-        opacities[filtered_camera_ids, filtered_gaussian_ids] * torch.exp(-sigmas), 0.999
+        opacities[fci_pos, fgi_pos] * torch.exp(-sigmas), 0.999
     )  # 29962MiB
 
-    del pos_ids, pos_indices, pixel_ids_x, pixel_ids_y, sigmas, deltas, c, filtered_gaussian_ids, filtered_camera_ids
+    del pos_ids, pos_indices, pixel_ids_x, pixel_ids_y, sigmas, deltas, c
     gc.collect()
     torch.cuda.empty_cache()
     
 
     # Negative Gaussians ------------------------
 
+    # Try to do minimal advanced indexing: first only create neg_ids as boolean mask
     neg_ids = opacities[0,gaussian_ids].flatten()<0 # [Ne]
     if neg_ids.sum()>0:
-        deltas_xy = pixel_coords[gaussian_ids[neg_ids],:] - means2d[camera_ids[neg_ids], gaussian_ids[neg_ids]]  # [Ne, 2]
-        deltas_z = depths_persp[camera_ids[pos_ids], gaussian_ids[pos_ids],None] - depths_persp[None,camera_ids[neg_ids],gaussian_ids[neg_ids]] # [P, Ne]
+
+        # Convert boolean mask to integer indices
+        neg_indices = torch.nonzero(neg_ids, as_tuple=False).squeeze(-1)
+
+        # Use integer indices to filter arrays - this typically uses less memory
+        fgi_neg = gaussian_ids[neg_indices] # filtered_gaussian_ids_neg
+        fci_neg   = camera_ids[neg_indices]  # filtered_camera_ids_pos
+
+
+        deltas_xy = pixel_coords[fgi_neg,:] - means2d[fci_neg, fgi_neg]  # [Ne, 2]
+        deltas_z = depths_persp[fci_pos, fgi_pos,None] - depths_persp[None,fci_neg,fgi_neg] # [P, Ne]
 
         deltas_z = rearrange(deltas_z,'p n  -> p n 1')
         deltas_xy = rearrange(deltas_xy,'n 2 -> p n 2',p=deltas_z.shape[0])
