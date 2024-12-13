@@ -627,6 +627,8 @@ def _torch_rasterization(
         _fully_fused_projection,
         _quat_scale_to_covar_preci,
         _rasterize_to_pixels,
+        _isect_tiles,
+        _isect_offset_encode
     )
 
     N = means.shape[0]
@@ -682,7 +684,7 @@ def _torch_rasterization(
     # Identify intersecting tiles
     tile_width = math.ceil(width / float(tile_size))
     tile_height = math.ceil(height / float(tile_size))
-    tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
+    tiles_per_gauss, isect_ids, flatten_ids = _isect_tiles(
         means2d,
         radii,
         depths,
@@ -694,7 +696,7 @@ def _torch_rasterization(
         camera_ids=camera_ids,
         gaussian_ids=gaussian_ids,
     )
-    isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
+    isect_offsets = _isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
     # Turn colors into [C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:
