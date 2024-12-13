@@ -600,7 +600,7 @@ def _torch_rasterization(
     render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
-    batch_per_iter: int = 100,
+    batch_per_iter: int = 1,
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
     packed:any=None,
     sparse_grad:any=None,
@@ -660,7 +660,7 @@ def _torch_rasterization(
     
     # Project Gaussians to 2D.
     # The results are with shape [C, N, ...]. Only the elements with radii > 0 are valid.
-    radii, means2d, depths, depths_persp, conics, compensations = _fully_fused_projection(
+    radii, means2d, depths, depths_persp, conics, covars3d, compensations = _fully_fused_projection(
         means,
         covars,
         viewmats,
@@ -747,6 +747,7 @@ def _torch_rasterization(
             render_colors_, render_alphas_ = _rasterize_to_pixels(
                 means2d,
                 conics,
+                covars3d,
                 colors_chunk,
                 opacities,
                 width,
@@ -766,6 +767,7 @@ def _torch_rasterization(
         render_colors, render_alphas = _rasterize_to_pixels(
             means2d,
             conics,
+            covars3d,
             colors,
             opacities,
             width,

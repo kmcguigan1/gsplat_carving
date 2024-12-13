@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange
 import gc
-
+import math
 
 def _quat_to_rotmat(quats: Tensor) -> Tensor:
     """Convert quaternion to rotation matrix."""
@@ -531,7 +531,7 @@ def _fully_fused_projection(
     radius[~inside] = 0.0
 
     radii = radius.int()
-    return radii, means2d, depths, depths_persp, conics, compensations
+    return radii, means2d, depths, depths_persp, conics, covars3d, compensations
 
 
 @torch.no_grad()
@@ -635,12 +635,73 @@ def _isect_offset_encode(
     offsets = cum_tile_counts - tile_counts
     return offsets.int()
 
+
+def delta_sparce(fci_pos, fgi_pos, fci_neg, fgi_neg, pixel_coords, means2d, depths_persp, covars3d):
+    
+    with torch.no_grad():
+        P = len(fci_pos)
+
+        N = len(fci_neg)
+
+        depths_pos = depths_persp[fci_pos,fgi_pos]
+
+        depths_neg = depths_persp[fci_neg,fgi_neg]
+
+        depth_threshold = 3*torch.sqrt(covars3d[fci_neg,fgi_neg,2,2]) # 3 standard deviations away [Neg]
+
+        number_of_iterations = 20
+
+        chunks_neg = math.ceil(N/number_of_iterations)
+
+        for start in range(0,N,chunks_neg):
+            
+            end = min(start + chunks_neg, N)
+
+            lb_depth = depths_neg[start] - depth_threshold[start] 
+            up_depth = depths_neg[end] + depth_threshold[end] 
+
+            start_pos, end_post = torch.searchsorted(depths_pos, torch.tensor([lb_depth,up_depth]))
+
+            deltas_z_chunk = depths_pos[start_pos:end_post,None] - depths_persp[None,fci_neg,fgi_neg]
+
+            mask = deltas_z_chunk.abs() <= depth_threshold.unsqueeze(0)
+
+            valid_indices = mask.nonzero(as_tuple=False)  # shape [nnz, 2], 
+            p_idx = valid_indices[:,0]
+            n_idx = valid_indices[:,1]
+
+
+
+
+    deltas_z = depths_persp[fci_pos,fgi_pos,None] - depths_persp[None,fci_neg,fgi_neg] # [Pos, Neg]
+
+    depth_threshold = 3*torch.sqrt(covars3d[:,2,2]) # 3 standard deviations away [Neg]
+
+    mask = deltas_z.abs() <= depth_threshold.unsqueeze(0)
+
+    valid_indices = mask.nonzero(as_tuple=False)  # shape [nnz, 2], 
+    p_idx = valid_indices[:,0]
+    n_idx = valid_indices[:,1]
+
+    deltas_xy_vals = pixel_coords[fgi_pos[p_idx],:] - means2d[fci_neg[n_idx], fgi_neg[n_idx],:]
+    deltas_z_vals = deltas_z[p_idx,n_idx]
+
+    deltas_z_vals = rearrange(deltas_z_vals,'M -> M 1')
+    delta_vals = torch.cat((deltas_xy_vals,deltas_z_vals),dim=-1)
+    
+    indices_for_deltas = torch.stack([p_idx, n_idx], dim=0) 
+    delta_sp = torch.sparse_coo_tensor(indices_for_deltas, delta_vals, size=(P, N, 3)).coalesce()
+
+    return delta_sp
+
+
 #TODO: function we need to change for negative gaussian splatting
 # I need the depths as well
 
 def accumulate(
     means2d: Tensor,  # [C, N, 2]
     conics: Tensor,  # [C, N, 3]
+    covars3d: Tensor,  # [C, N, 3]
     opacities: Tensor,  # [C, N]
     colors: Tensor,  # [C, N, channels]
     gaussian_ids: Tensor,  # [M]
@@ -732,46 +793,70 @@ def accumulate(
         opacities[fci_pos, fgi_pos] * torch.exp(-sigmas), 0.999
     )  # 29962MiB
 
-    del pos_ids, pos_indices, pixel_ids_x, pixel_ids_y, sigmas, deltas, c
+    del pixel_ids_x, pixel_ids_y, sigmas, deltas, c
     gc.collect()
     torch.cuda.empty_cache()
     
-
+    pos_length = pos_ids.sum()
     # Negative Gaussians ------------------------
 
     # Try to do minimal advanced indexing: first only create neg_ids as boolean mask
     neg_ids = opacities[0,gaussian_ids].flatten()<0 # [Ne]
-    if neg_ids.sum()>0:
 
+    neg_length = neg_ids.sum()
+
+    if neg_length>0:
         # Convert boolean mask to integer indices
         neg_indices = torch.nonzero(neg_ids, as_tuple=False).squeeze(-1)
 
         # Use integer indices to filter arrays - this typically uses less memory
         fgi_neg = gaussian_ids[neg_indices] # filtered_gaussian_ids_neg
-        fci_neg   = camera_ids[neg_indices]  # filtered_camera_ids_pos
+        fci_neg = camera_ids[neg_indices]  # filtered_camera_ids_pos
+
+        d_sp = delta_sparce(fci_pos, fgi_pos, fci_neg, fgi_neg, pixel_coords, means2d, depths_persp, covars3d)
+        
+        pos_chunk = 100
+
+        for start in range (0,pos_length, pos_chunk):
+
+            end = min(start + pos_chunk, pos_length)
+
+            fgi_pos_chunk = fgi_pos[start:end] 
+            fci_pos_chunk = fci_pos[start:end]
 
 
-        deltas_xy = pixel_coords[fgi_neg,:] - means2d[fci_neg, fgi_neg]  # [Ne, 2]
-        deltas_z = depths_persp[fci_pos, fgi_pos,None] - depths_persp[None,fci_neg,fgi_neg] # [P, Ne]
 
-        deltas_z = rearrange(deltas_z,'p n  -> p n 1')
-        deltas_xy = rearrange(deltas_xy,'n 2 -> p n 2',p=deltas_z.shape[0])
 
-        deltas = torch.cat((deltas_xy,deltas_z),dim=-1)
+            deltas_xy = pixel_coords[fgi_pos_chunk,None,:] - means2d[None,fci_neg, fgi_neg]  # [Pos_chunk, Ne, 2]
+            deltas_z = depths_persp[fci_pos_chunk,fgi_pos_chunk,None] - depths_persp[None,fci_neg,fgi_neg] # [Pos_chunk, Ne]
 
-        sigmas_neg  = (
-            0.5 * (c[..., 0, 0] * deltas[:, 0] ** 2 + c[..., 1, 1] * deltas[:, 1] ** 2 + c[..., 2, 2] * deltas[:, 2] ** 2) +
-            (c[..., 0, 1] * deltas[:, 0] * deltas[:, 1] + c[..., 0, 2] * deltas[:, 0] * deltas[:, 2] + c[..., 1, 2] * deltas[:, 1] * deltas[:, 2]  )
-        ) # [P Ne]
+            deltas_z = rearrange(deltas_z,'p n  -> p n 1')
 
-        # [None, Ne] * [P Ne]
-        neg_alphas = opacities[None, camera_ids[neg_ids], gaussian_ids[neg_ids]] * torch.exp(-sigmas_neg)
+            deltas = torch.cat((deltas_xy,deltas_z),dim=-1)
 
-        neg_alphas = torch.einsum('pn -> p',neg_alphas) # P
+            c = conics[fci_neg, fgi_neg,:,:]  # [Neg, 3, 3]
 
-        alphas = alphas +  neg_alphas
+            sigmas_neg  = (
+                0.5 * (c[None,:, 0, 0] * deltas[:,:,0] ** 2 + 
+                       c[None,:, 1, 1] * deltas[:,:,1] ** 2 + 
+                       c[None,:, 2, 2] * deltas[:,:,2] ** 2) +
+                (c[None,:, 0, 1] * deltas[:,:, 0] * deltas[:,:, 1] + 
+                 c[None,:, 0, 2] * deltas[:,:, 0] * deltas[:,:, 2] + 
+                 c[None,:, 1, 2] * deltas[:,:, 1] * deltas[:,:, 2])
+            ) # [Pos_chunk Ne]
 
-        alphas = alphas.clip(min=0)
+            # [None, Ne] * [Pos_chunk Ne]
+            neg_alphas = opacities[None, fci_neg, fgi_neg] * torch.exp(-sigmas_neg)
+
+            neg_alphas = torch.einsum('pn -> p',neg_alphas) # Pos_chunk
+
+            alphas[start:end] = alphas[start:end] +  neg_alphas
+
+            alphas[start:end] = alphas[start:end].clip(min=0)
+
+            del deltas_z, deltas_xy, deltas, neg_alphas, sigmas_neg, fgi_pos_chunk, fci_pos_chunk, fgi_neg, fci_neg
+            gc.collect()
+            torch.cuda.empty_cache()
 
 
     indices = camera_ids * image_height * image_width + pixel_ids # 38378MiB 
@@ -796,6 +881,7 @@ def accumulate(
 def _rasterize_to_pixels(
     means2d: Tensor,  # [C, N, 2]
     conics: Tensor,  # [C, N, 3]
+    covars3d: Tensor, # [C, N, 3]
     colors: Tensor,  # [C, N, channels]
     opacities: Tensor,  # [C, N]
     image_width: int,
@@ -883,6 +969,7 @@ def _rasterize_to_pixels(
         renders_step, accs_step = accumulate(
             means2d,
             conics,
+            covars3d,
             opacities,
             colors,
             gs_ids,
