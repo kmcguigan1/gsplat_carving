@@ -397,7 +397,6 @@ def isect_tiles(
         assert radii.shape == (C, N), radii.size()
         assert depths.shape == (C, N), depths.size()
 
-    # Flatten ids are sorted based on depth
     tiles_per_gauss, isect_ids, flatten_ids = _make_lazy_cuda_func("isect_tiles")(
         means2d.contiguous(),
         radii.contiguous(),
@@ -641,6 +640,69 @@ def rasterize_to_indices_in_range(
     )
     out_pixel_ids = out_indices % (image_width * image_height)
     out_camera_ids = out_indices // (image_width * image_height)
+    return out_gauss_ids, out_pixel_ids, out_camera_ids
+
+
+@torch.no_grad()
+def rasterize_to_indices_in_range(
+    range_start: int,
+    range_end: int,
+    transmittances: torch.Tensor,  # [C, image_height, image_width]
+    means2d: torch.Tensor,  # [C, N, 2]
+    conics: torch.Tensor,  # [C, N, 3]
+    opacities: torch.Tensor,  # [C, N]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: torch.Tensor,  # [C, tile_height, tile_width]
+    flatten_ids: torch.Tensor,  # [n_isects]
+    depths: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Rasterizes a batch of Gaussians to images but only returns the indices and tile_offsets.
+
+    Args:
+        range_start: start batch index.
+        range_end: end batch index.
+        transmittances: [C, image_height, image_width]
+        means2d: [C, N, 2]
+        conics: [C, N, 3]
+        opacities: [C, N]
+        image_width: width
+        image_height: height
+        tile_size: tile size
+        isect_offsets: [C, tile_height, tile_width]
+        flatten_ids: [n_isects]
+
+    Returns:
+        - gaussian_ids [M]: Indices of gaussians
+        - pixel_ids [M]: Pixel indices (row-major)
+        - camera_ids [M]: Camera indices
+        - tile_offsets [C * tile_height * tile_width + 1]: Offsets for each tile in the final arrays
+    """
+    C, N, _ = means2d.shape
+    tile_height, tile_width = isect_offsets.shape[1], isect_offsets.shape[2]
+
+    # Call the CUDA wrapper (first pass counts)
+    out_gauss_ids, out_indices = _make_lazy_cuda_func("rasterize_to_indices_in_range")(
+        range_start,
+        range_end,
+        transmittances.contiguous(),
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+    )
+    # out_indices encodes camera and pixel_id: pixel_id + camera_id*(image_width*image_height)
+    out_pixel_ids = out_indices % (image_width * image_height)
+    out_camera_ids = out_indices // (image_width * image_height)
+
+
+
     return out_gauss_ids, out_pixel_ids, out_camera_ids
 
 

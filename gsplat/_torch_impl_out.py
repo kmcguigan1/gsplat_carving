@@ -8,6 +8,7 @@ from torch import Tensor
 from einops import rearrange
 import gc
 import math
+import os
 
 def _quat_to_rotmat(quats: Tensor) -> Tensor:
     """Convert quaternion to rotation matrix."""
@@ -636,6 +637,40 @@ def _isect_offset_encode(
     return offsets.int()
 
 
+@torch.no_grad()
+def sort_ids_and_get_offsets(original_ids):
+    """
+    Sorts the input tensor of IDs and returns the sorted tensor along with a list of offsets.
+    
+    Parameters:
+    original_ids (torch.Tensor): 1D tensor containing unsorted IDs.
+    
+    Returns:
+    sorted_ids (torch.Tensor): Tensor of sorted IDs.
+    offsets (torch.Tensor): 1D tensor containing offsets indicating where each unique ID starts.
+    unique_ids (torch.Tensor): Tensor of unique sorted IDs.
+    counts (torch.Tensor): Tensor containing counts of each unique ID.
+    """
+    # Ensure the input is a 1D tensor
+    if original_ids.dim() != 1:
+        raise ValueError("Input tensor must be 1-dimensional")
+    
+    # Step 1: Sort the tensor
+    sorted_ids, sorted_indices = torch.sort(original_ids)
+    
+    # Step 2: Find unique IDs and their counts
+    unique_ids, counts = torch.unique(sorted_ids, return_counts=True)
+    
+    # Step 3: Compute offsets
+    # Compute the cumulative sum of counts to get the end indices
+    cumulative_counts = torch.cumsum(counts, dim=0)
+    
+    # Prepend 0 to the cumulative counts to get the starting offsets
+    offsets = torch.cat((torch.tensor([0], device=counts.device), cumulative_counts))
+    
+    return sorted_ids, sorted_indices, offsets, unique_ids, counts
+
+
 def delta_sparce(fci_pos, fgi_pos, fci_neg, fgi_neg, pixel_coords, means2d, depths_persp, covars3d):
     
     with torch.no_grad():
@@ -649,33 +684,9 @@ def delta_sparce(fci_pos, fgi_pos, fci_neg, fgi_neg, pixel_coords, means2d, dept
 
         depth_threshold = 3*torch.sqrt(covars3d[fci_neg,fgi_neg,2,2]) # 3 standard deviations away [Neg]
 
-        number_of_iterations = 20
+        deltas_z = depths_persp[fci_pos,fgi_pos,None] - depths_persp[None,fci_neg,fgi_neg] # [Pos, Neg]
 
-        chunks_neg = math.ceil(N/number_of_iterations)
-
-        for start in range(0,N,chunks_neg):
-            
-            end = min(start + chunks_neg, N)
-
-            lb_depth = depths_neg[start] - depth_threshold[start] 
-            up_depth = depths_neg[end] + depth_threshold[end] 
-
-            start_pos, end_post = torch.searchsorted(depths_pos, torch.tensor([lb_depth,up_depth]))
-
-            deltas_z_chunk = depths_pos[start_pos:end_post,None] - depths_persp[None,fci_neg,fgi_neg]
-
-            mask = deltas_z_chunk.abs() <= depth_threshold.unsqueeze(0)
-
-            valid_indices = mask.nonzero(as_tuple=False)  # shape [nnz, 2], 
-            p_idx = valid_indices[:,0]
-            n_idx = valid_indices[:,1]
-
-
-
-
-    deltas_z = depths_persp[fci_pos,fgi_pos,None] - depths_persp[None,fci_neg,fgi_neg] # [Pos, Neg]
-
-    depth_threshold = 3*torch.sqrt(covars3d[:,2,2]) # 3 standard deviations away [Neg]
+        depth_threshold = 3*torch.sqrt(covars3d[:,2,2]) # 3 standard deviations away [Neg]
 
     mask = deltas_z.abs() <= depth_threshold.unsqueeze(0)
 
@@ -707,9 +718,12 @@ def accumulate(
     gaussian_ids: Tensor,  # [M]
     pixel_ids: Tensor,  # [M]
     camera_ids: Tensor,  # [M]
+    tile_height: int,
+    tile_width: int,
     image_width: int,
     image_height: int,
-    depths_persp: Tensor # [C, N]
+    tile_size: int,
+    depths_persp: Tensor, # [C, N]
 ) -> Tuple[Tensor, Tensor]:
     """Alpah compositing of 2D Gaussians in Pure Pytorch.
 
@@ -755,11 +769,17 @@ def accumulate(
     except ImportError:
         raise ImportError("Please install nerfacc package: pip install nerfacc")
 
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
     C, N = means2d.shape[:2]
     channels = colors.shape[-1]
 
     pixel_ids_x = pixel_ids % image_width
-    pixel_ids_y = pixel_ids // image_width  # 8542MiB
+    pixel_ids_y = pixel_ids // image_width
+    tile_ids_x = pixel_ids_x // tile_size
+    tile_ids_y = pixel_ids_y // tile_size
+
+
     pixel_coords = torch.stack([pixel_ids_x, pixel_ids_y], dim=-1) + 0.5  # [M, 2] 13132MiB
 
 
@@ -797,7 +817,6 @@ def accumulate(
     gc.collect()
     torch.cuda.empty_cache()
     
-    pos_length = pos_ids.sum()
     # Negative Gaussians ------------------------
 
     # Try to do minimal advanced indexing: first only create neg_ids as boolean mask
@@ -806,35 +825,46 @@ def accumulate(
     neg_length = neg_ids.sum()
 
     if neg_length>0:
-        # Convert boolean mask to integer indices
-        neg_indices = torch.nonzero(neg_ids, as_tuple=False).squeeze(-1)
 
-        # Use integer indices to filter arrays - this typically uses less memory
-        fgi_neg = gaussian_ids[neg_indices] # filtered_gaussian_ids_neg
-        fci_neg = camera_ids[neg_indices]  # filtered_camera_ids_pos
+        tile_id_per_elem = camera_ids * (tile_height * tile_width) + (tile_ids_y * tile_width) + tile_ids_x
 
-        d_sp = delta_sparce(fci_pos, fgi_pos, fci_neg, fgi_neg, pixel_coords, means2d, depths_persp, covars3d)
-        
-        pos_chunk = 100
+        sorted_ids, sorted_indices, offsets, unique_ids, counts = sort_ids_and_get_offsets(tile_id_per_elem)
 
-        for start in range (0,pos_length, pos_chunk):
+        for i in range(0,len(offsets)-1):
 
-            end = min(start + pos_chunk, pos_length)
+            tile_indices = sorted_indices[offsets[i]:offsets[i+1]]
 
-            fgi_pos_chunk = fgi_pos[start:end] 
-            fci_pos_chunk = fci_pos[start:end]
+            # Try to do minimal advanced indexing: first only create pos_ids as boolean mask
+            pos_tile_mask = (opacities[0, gaussian_ids[tile_indices]].flatten() > 0)
+
+            # Convert boolean mask to integer indices
+            pos_tile_indices = tile_indices[pos_tile_mask]
+
+            # Try to do minimal advanced indexing: first only create pos_ids as boolean mask
+            neg_tile_mask = (opacities[0, gaussian_ids[tile_indices]].flatten() < 0)
+
+            if neg_tile_mask.sum() == 0:
+                continue
+
+            # Convert boolean mask to integer indices
+            neg_tile_indices = tile_indices[neg_tile_mask]
+
+            # Use integer indices to filter arrays - this typically uses less memory
+            fgi_tile_pos = gaussian_ids[pos_tile_indices] # filtered_gaussian_ids_neg
+            fci_tile_pos = camera_ids[pos_tile_indices]  # filtered_camera_ids_pos
+
+            fgi_tile_neg = gaussian_ids[neg_tile_indices] # filtered_gaussian_ids_neg
+            fci_tile_neg = camera_ids[neg_tile_indices]  # filtered_camera_ids_pos
 
 
-
-
-            deltas_xy = pixel_coords[fgi_pos_chunk,None,:] - means2d[None,fci_neg, fgi_neg]  # [Pos_chunk, Ne, 2]
-            deltas_z = depths_persp[fci_pos_chunk,fgi_pos_chunk,None] - depths_persp[None,fci_neg,fgi_neg] # [Pos_chunk, Ne]
+            deltas_xy = pixel_coords[fgi_tile_pos,None,:] - means2d[None,fci_tile_neg, fgi_tile_neg]  # [Pos_chunk, Ne, 2]
+            deltas_z = depths_persp[fci_tile_pos,fgi_tile_pos,None] - depths_persp[None,fci_tile_neg,fgi_tile_neg] # [Pos_chunk, Ne]
 
             deltas_z = rearrange(deltas_z,'p n  -> p n 1')
 
             deltas = torch.cat((deltas_xy,deltas_z),dim=-1)
 
-            c = conics[fci_neg, fgi_neg,:,:]  # [Neg, 3, 3]
+            c = conics[fci_tile_neg, fgi_tile_neg,:,:]  # [Neg, 3, 3]
 
             sigmas_neg  = (
                 0.5 * (c[None,:, 0, 0] * deltas[:,:,0] ** 2 + 
@@ -846,15 +876,15 @@ def accumulate(
             ) # [Pos_chunk Ne]
 
             # [None, Ne] * [Pos_chunk Ne]
-            neg_alphas = opacities[None, fci_neg, fgi_neg] * torch.exp(-sigmas_neg)
+            neg_alphas = opacities[None, fci_tile_neg, fgi_tile_neg] * torch.exp(-sigmas_neg)
 
             neg_alphas = torch.einsum('pn -> p',neg_alphas) # Pos_chunk
 
-            alphas[start:end] = alphas[start:end] +  neg_alphas
+            alphas[fgi_tile_pos] = alphas[fgi_tile_pos] +  neg_alphas
 
-            alphas[start:end] = alphas[start:end].clip(min=0)
+            alphas[fgi_tile_pos] = alphas[fgi_tile_pos].clip(min=0)
 
-            del deltas_z, deltas_xy, deltas, neg_alphas, sigmas_neg, fgi_pos_chunk, fci_pos_chunk, fgi_neg, fci_neg
+            del deltas_z, deltas_xy, deltas, neg_alphas, sigmas_neg, fgi_tile_pos, fci_tile_pos, fgi_tile_neg, fci_tile_neg
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -917,6 +947,7 @@ def _rasterize_to_pixels(
     """
     from .cuda._wrapper import rasterize_to_indices_in_range
 
+    tile_height, tile_width = isect_offsets.shape[1], isect_offsets.shape[2]
     C, N = means2d.shape[:2]
     n_isects = len(flatten_ids)
     device = means2d.device
@@ -958,6 +989,7 @@ def _rasterize_to_pixels(
             tile_size,
             isect_offsets,
             flatten_ids,
+            depths_persp
         )  # [M], [M]
 
         if len(gs_ids) == 0:
@@ -975,8 +1007,11 @@ def _rasterize_to_pixels(
             gs_ids,
             pixel_ids,
             camera_ids,
+            tile_height,
+            tile_width,
             image_width,
             image_height,
+            tile_size,
             depths_persp
         ) # 7012MiB
         render_colors = render_colors + renders_step * transmittances[..., None]

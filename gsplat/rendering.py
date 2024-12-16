@@ -600,7 +600,7 @@ def _torch_rasterization(
     render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
-    batch_per_iter: int = 1,
+    batch_per_iter: int = 100,
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
     packed:any=None,
     sparse_grad:any=None,
@@ -684,7 +684,7 @@ def _torch_rasterization(
     # Identify intersecting tiles
     tile_width = math.ceil(width / float(tile_size))
     tile_height = math.ceil(height / float(tile_size))
-    tiles_per_gauss, isect_ids, flatten_ids = _isect_tiles(
+    tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
         means2d,
         radii,
         depths,
@@ -696,7 +696,7 @@ def _torch_rasterization(
         camera_ids=camera_ids,
         gaussian_ids=gaussian_ids,
     )
-    isect_offsets = _isect_offset_encode(isect_ids, C, tile_width, tile_height)
+    isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
     # Turn colors into [C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:
