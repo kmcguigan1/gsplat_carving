@@ -671,26 +671,21 @@ def sort_ids_and_get_offsets(original_ids):
     return sorted_ids, sorted_indices, offsets, unique_ids, counts
 
 
-def delta_sparce(fci_pos, fgi_pos, fci_neg, fgi_neg, pixel_coords, means2d, depths_persp, covars3d):
+def delta_sparce(fci_pos, fgi_pos, fci_neg, fgi_neg, pixel_coords, means2d, depths_persp, covars3d, i):
     
     with torch.no_grad():
         P = len(fci_pos)
 
         N = len(fci_neg)
 
-        depths_pos = depths_persp[fci_pos,fgi_pos]
-
-        depths_neg = depths_persp[fci_neg,fgi_neg]
-
-        depth_threshold = 3*torch.sqrt(covars3d[fci_neg,fgi_neg,2,2]) # 3 standard deviations away [Neg]
+        depth_threshold = 1*torch.sqrt(covars3d[fci_neg,fgi_neg,2,2]) # 3 standard deviations away [Neg]
 
         deltas_z = depths_persp[fci_pos,fgi_pos,None] - depths_persp[None,fci_neg,fgi_neg] # [Pos, Neg]
 
-        depth_threshold = 3*torch.sqrt(covars3d[:,2,2]) # 3 standard deviations away [Neg]
+        mask = deltas_z.abs() <= depth_threshold.unsqueeze(0)
 
-    mask = deltas_z.abs() <= depth_threshold.unsqueeze(0)
+        valid_indices = mask.nonzero(as_tuple=False)  # shape [nnz, 2], 
 
-    valid_indices = mask.nonzero(as_tuple=False)  # shape [nnz, 2], 
     p_idx = valid_indices[:,0]
     n_idx = valid_indices[:,1]
 
@@ -849,6 +844,9 @@ def accumulate(
             # Convert boolean mask to integer indices
             neg_tile_indices = tile_indices[neg_tile_mask]
 
+            P = len(pos_tile_indices)
+            N = len(neg_tile_indices)
+
             # Use integer indices to filter arrays - this typically uses less memory
             fgi_tile_pos = gaussian_ids[pos_tile_indices] # filtered_gaussian_ids_neg
             fci_tile_pos = camera_ids[pos_tile_indices]  # filtered_camera_ids_pos
@@ -857,34 +855,41 @@ def accumulate(
             fci_tile_neg = camera_ids[neg_tile_indices]  # filtered_camera_ids_pos
 
 
-            deltas_xy = pixel_coords[fgi_tile_pos,None,:] - means2d[None,fci_tile_neg, fgi_tile_neg]  # [Pos_chunk, Ne, 2]
-            deltas_z = depths_persp[fci_tile_pos,fgi_tile_pos,None] - depths_persp[None,fci_tile_neg,fgi_tile_neg] # [Pos_chunk, Ne]
+            delta_sp = delta_sparce(fci_tile_pos, fgi_tile_pos, fci_tile_neg, fgi_tile_neg, pixel_coords, means2d, depths_persp, covars3d,i) # 3450 MB
 
-            deltas_z = rearrange(deltas_z,'p n  -> p n 1')
+            # # deltas_xy = pixel_coords[fgi_tile_pos,None,:] - means2d[None,fci_tile_neg, fgi_tile_neg]  # [Pos_chunk, Ne, 2]
+            # # deltas_z = depths_persp[fci_tile_pos,fgi_tile_pos,None] - depths_persp[None,fci_tile_neg,fgi_tile_neg] # [Pos_chunk, Ne]
 
-            deltas = torch.cat((deltas_xy,deltas_z),dim=-1)
+            # deltas_z = rearrange(deltas_z,'p n  -> p n 1')
 
-            c = conics[fci_tile_neg, fgi_tile_neg,:,:]  # [Neg, 3, 3]
+            # deltas = torch.cat((deltas_xy,deltas_z),dim=-1)
 
-            sigmas_neg  = (
-                0.5 * (c[None,:, 0, 0] * deltas[:,:,0] ** 2 + 
-                       c[None,:, 1, 1] * deltas[:,:,1] ** 2 + 
-                       c[None,:, 2, 2] * deltas[:,:,2] ** 2) +
-                (c[None,:, 0, 1] * deltas[:,:, 0] * deltas[:,:, 1] + 
-                 c[None,:, 0, 2] * deltas[:,:, 0] * deltas[:,:, 2] + 
-                 c[None,:, 1, 2] * deltas[:,:, 1] * deltas[:,:, 2])
-            ) # [Pos_chunk Ne]
+            # Compute D in sparse form
+            delta_sp_vals = delta_sp._values()    # [nnz, 3] on cuda:2
+            delta_sp_idx = delta_sp._indices()     # [3, nnz], on cuda:2
+            p_idx_sp = delta_sp_idx[0]
+            n_idx_sp = delta_sp_idx[1]
 
-            # [None, Ne] * [Pos_chunk Ne]
-            neg_alphas = opacities[None, fci_tile_neg, fgi_tile_neg] * torch.exp(-sigmas_neg)
+            c = conics[fci_tile_neg[n_idx_sp], fgi_tile_neg[n_idx_sp],:,:]  # [Neg, 3, 3]
 
-            neg_alphas = torch.einsum('pn -> p',neg_alphas) # Pos_chunk
+            sigmas_neg = torch.einsum('bi,bij,bj->b', delta_sp_vals, c, delta_sp_vals)  # [nnz]
+
+            opacities_subset = opacities[fci_tile_neg[n_idx_sp], fgi_tile_neg[n_idx_sp]]
+            neg_alphas_vals_sp = opacities_subset * torch.exp(-0.5 * sigmas_neg)
+
+            # neg_alpha_sp = torch.sparse_coo_tensor(delta_sp_idx, neg_alphas_vals, size=(P, N), device=device).coalesce()
+
+
+            neg_alphas = torch.zeros((P), device=neg_alphas_vals_sp.device)
+
+            # Scatter-add the A_neg_vals into A_dense_from_sparse using the (k_idx_sp, p_idx_sp) indices.
+            neg_alphas.scatter_add_(0, p_idx_sp, neg_alphas_vals_sp)
 
             alphas[fgi_tile_pos] = alphas[fgi_tile_pos] +  neg_alphas
 
             alphas[fgi_tile_pos] = alphas[fgi_tile_pos].clip(min=0)
 
-            del deltas_z, deltas_xy, deltas, neg_alphas, sigmas_neg, fgi_tile_pos, fci_tile_pos, fgi_tile_neg, fci_tile_neg
+            del neg_alphas_vals_sp, sigmas_neg, fgi_tile_pos, fci_tile_pos, fgi_tile_neg, fci_tile_neg, opacities_subset, neg_alphas, delta_sp
             gc.collect()
             torch.cuda.empty_cache()
 
